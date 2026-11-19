@@ -3,6 +3,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.training import router as training_router
+from app.api.predictions import router as predictions_router
+from app.api.datasets import router as datasets_router
+from app.api.reports import router as reports_router
+
+
 app = FastAPI(
     title="ModelDoctor API",
     description="Intelligent Detection and Mitigation of Unreliable ML Predictions",
@@ -23,12 +29,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register API routers
+app.include_router(training_router)
+app.include_router(predictions_router)
+app.include_router(datasets_router)
+app.include_router(reports_router)
+
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint confirming API service status."""
     return {"status": "ok"}
-
-from app.api.predictions import router as predictions_router
-
-app.include_router(predictions_router)
