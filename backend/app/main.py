@@ -28,3 +28,7 @@ app.add_middleware(
 async def health_check():
     """Health check endpoint confirming API service status."""
     return {"status": "ok"}
+
+from app.api.predictions import router as predictions_router
+
+app.include_router(predictions_router)

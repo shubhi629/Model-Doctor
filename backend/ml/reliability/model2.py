@@ -151,39 +151,89 @@ def evaluate_oof_cv(
     y: np.ndarray,
     cv_splits: List[Tuple[np.ndarray, np.ndarray]],
 ) -> Tuple[np.ndarray, float]:
-    """
-    Compute Out-Of-Fold (OOF) predicted probabilities and CV AUROC for detecting errors.
-    Target: 1 = correct, 0 = incorrect.
-    Error AUROC: ranking incorrect predictions higher (using P(incorrect) = 1 - P(correct)).
-    """
+
+    import warnings
+
     n_samples = len(X)
     oof_probs = np.zeros(n_samples, dtype=np.float64)
 
-    for train_idx, val_idx in cv_splits:
+    for fold, (train_idx, val_idx) in enumerate(cv_splits, 1):
+
         X_tr, y_tr = X.iloc[train_idx], y[train_idx]
-        X_va, y_va = X.iloc[val_idx], y[val_idx]
+        X_va = X.iloc[val_idx]
+
+        print(f"\nChecking fold {fold}/5")
 
         fold_pipe = clone(pipeline)
-        fold_pipe.fit(X_tr, y_tr)
 
-        p = fold_pipe.predict_proba(X_va)
+        # Step 1: Check model training
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+                fold_pipe.fit(X_tr, y_tr)
+
+            print("Training: PASSED")
+
+        except Exception as e:
+            print("TRAINING FAILED:", repr(e))
+            print("Training data finite:",
+                  np.isfinite(X_tr.to_numpy()).all())
+            print("Training max abs:",
+                  np.max(np.abs(X_tr.to_numpy())))
+            raise
+
+                # Step 2: Check predictions
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", RuntimeWarning)
+
+                X_scaled = fold_pipe.named_steps["scaler"].transform(X_va)
+                clf = fold_pipe.named_steps["classifier"]
+
+                print("Scaled shape:", X_scaled.shape)
+                print("Scaled dtype:", X_scaled.dtype)
+                print("Scaled min:", np.min(X_scaled))
+                print("Scaled max:", np.max(X_scaled))
+
+                if hasattr(clf, "coef_"):
+                    print("Coefficient shape:", clf.coef_.shape)
+                    print("Coefficient dtype:", clf.coef_.dtype)
+                    print("Coefficient min:", np.min(clf.coef_))
+                    print("Coefficient max:", np.max(clf.coef_))
+
+                p = fold_pipe.predict_proba(X_va)
+
+            print("Prediction: PASSED")
+
+        except Exception as e:
+            print("PREDICTION FAILED:", repr(e))
+
+            X_scaled = fold_pipe.named_steps["scaler"].transform(X_va)
+
+            print("Validation finite:", np.isfinite(X_scaled).all())
+            print("Validation max abs:", np.max(np.abs(X_scaled)))
+
+            clf = fold_pipe.named_steps["classifier"]
+
+            if hasattr(clf, "coef_"):
+                print("Coefficients finite:", np.isfinite(clf.coef_).all())
+                print("Max coefficient:", np.max(np.abs(clf.coef_)))
+
+            raise
         if p.shape[1] == 2:
             oof_probs[val_idx] = p[:, 1]
         else:
             oof_probs[val_idx] = p[:, 0]
 
-    # AUROC for identifying incorrect predictions
-    # y=0 is incorrect, y=1 is correct.
-    # Score for incorrect: 1 - oof_probs
     is_incorrect = (1 - y).astype(int)
     error_risk = 1.0 - oof_probs
+
     try:
         auroc = float(roc_auc_score(is_incorrect, error_risk))
     except Exception:
         auroc = 0.5
 
     return oof_probs, auroc
-
 
 def train_model2(
     features_df: pd.DataFrame,
@@ -286,18 +336,10 @@ def train_model2(
     ])
     X_conf = features_df[["max_prob"]].copy()
     oof_conf_probs, conf_ref_auroc = evaluate_oof_cv(conf_pipe, X_conf, y_arr, cv_splits)
-
-    # Candidate 1: Logistic Regression (UNWEIGHTED for honest probability calibration)
-    # RATIONALE: We remove class_weight="balanced" because we want true empirical probabilities,
-    # not probabilities artificially shifted toward a synthetic 50/50 prior.
-    lr_pipe = Pipeline([
-        ("scaler", StandardScaler()),
-        ("classifier", LogisticRegression(
-            max_iter=1000,
-            random_state=random_state,
-        )),
-    ])
-    oof_lr_probs, lr_auroc = evaluate_oof_cv(lr_pipe, X, y_arr, cv_splits)
+    # Candidate 1: Logistic Regression temporarily skipped
+    # Confidence baseline retained for comparison only.
+    oof_lr_probs = oof_conf_probs.copy()
+    lr_auroc = conf_ref_auroc
 
     # Candidate 2: Small regularized Gradient Boosting (calibrated with sigmoid)
     # RATIONALE: Wrapped in CalibratedClassifierCV with method="sigmoid" because the calibration
@@ -317,33 +359,22 @@ def train_model2(
 
     # Compute ECE and Brier scores for all candidates
     candidates_scores = {
-        "Logistic Regression": {
-            "cv_auroc": round(lr_auroc, 4),
-            "ece": compute_ece(y_arr, oof_lr_probs),
-            "brier": compute_brier_score(y_arr, oof_lr_probs),
-        },
-        "Gradient Boosting": {
-            "cv_auroc": round(gb_auroc, 4),
-            "ece": compute_ece(y_arr, oof_gb_probs),
-            "brier": compute_brier_score(y_arr, oof_gb_probs),
-        },
-        "Confidence Baseline (max_prob only)": {
-            "cv_auroc": round(conf_ref_auroc, 4),
-            "ece": compute_ece(y_arr, oof_conf_probs),
-            "brier": compute_brier_score(y_arr, oof_conf_probs),
-        },
-    }
+    "Gradient Boosting": {
+        "cv_auroc": round(gb_auroc, 4),
+        "ece": compute_ece(y_arr, oof_gb_probs),
+        "brier": compute_brier_score(y_arr, oof_gb_probs),
+    },
+    "Confidence Baseline (max_prob only)": {
+        "cv_auroc": round(conf_ref_auroc, 4),
+        "ece": compute_ece(y_arr, oof_conf_probs),
+        "brier": compute_brier_score(y_arr, oof_conf_probs),
+    },
+}
 
-    if gb_auroc > lr_auroc:
-        winner_name = "Gradient Boosting"
-        winner_pipe = gb_pipe
-        oof_trustworthiness = oof_gb_probs
-        winner_auroc = gb_auroc
-    else:
-        winner_name = "Logistic Regression"
-        winner_pipe = lr_pipe
-        oof_trustworthiness = oof_lr_probs
-        winner_auroc = lr_auroc
+    winner_name = "Gradient Boosting"
+    winner_pipe = gb_pipe
+    oof_trustworthiness = oof_gb_probs
+    winner_auroc = gb_auroc
 
     # Final fit on the entire calibration split
     final_pipeline = clone(winner_pipe)
@@ -375,10 +406,9 @@ def train_model2(
         "brier_score": final_brier,
         "reliability_table": rel_table,
         "oof_candidates": {
-            "Logistic Regression": oof_lr_probs,
-            "Gradient Boosting": oof_gb_probs,
-            "Confidence Baseline": oof_conf_probs,
-        },
+    "Gradient Boosting": oof_gb_probs,
+    "Confidence Baseline": oof_conf_probs,
+},
         "n_correct": n_correct,
         "n_incorrect": n_incorrect,
         "message": None,
