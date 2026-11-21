@@ -97,12 +97,11 @@ class ReliabilityFeatureExtractor:
         for col in self.numeric_features_:
             if col in X_train_raw.columns:
                 series = pd.to_numeric(X_train_raw[col], errors="coerce").dropna()
+                # A column with no observed train values has no known range; leaving it
+                # out avoids flagging every inference value as out-of-range against (0, 0).
                 if len(series) > 0:
                     self.train_min_[col] = float(series.min())
                     self.train_max_[col] = float(series.max())
-                else:
-                    self.train_min_[col] = 0.0
-                    self.train_max_[col] = 0.0
 
         self.train_categories_ = {}
         for col in self.categorical_features_:
@@ -159,8 +158,17 @@ class ReliabilityFeatureExtractor:
         rng = np.random.RandomState(self.random_state)
         n_train = len(X_train_raw)
 
+        # Stratified bootstrap: resample WITHIN each class so every bootstrap copy
+        # sees every class. A plain bootstrap can drop a rare class entirely, which
+        # makes predict_proba return fewer columns (misaligned probabilities) and
+        # makes XGBoost refuse to fit (it requires contiguous labels).
+        class_indices = [np.where(y_train == c)[0] for c in self.classes_]
+
         for _ in range(self.n_bootstraps):
-            boot_idx = rng.choice(n_train, size=n_train, replace=True)
+            boot_idx = np.concatenate([
+                rng.choice(idx, size=len(idx), replace=True) for idx in class_indices
+            ])
+            rng.shuffle(boot_idx)
             X_boot = X_train_raw.iloc[boot_idx]
             y_boot = y_train[boot_idx]
 
@@ -256,6 +264,16 @@ class ReliabilityFeatureExtractor:
                 b_p = np.asarray(b_p, dtype=np.float64)
                 if b_p.ndim == 1:
                     b_p = np.column_stack([1.0 - b_p, b_p])
+                # Align columns to the full class set (defensive: a copy that never
+                # saw a class gets probability 0 for it instead of shifted columns).
+                boot_classes = getattr(boot_pipe, "classes_", None)
+                if boot_classes is not None and len(boot_classes) != self.num_classes_:
+                    aligned = np.zeros((n_samples, self.num_classes_), dtype=np.float64)
+                    for j, c in enumerate(boot_classes):
+                        pos = int(np.searchsorted(self.classes_, c))
+                        if pos < self.num_classes_ and self.classes_[pos] == c:
+                            aligned[:, pos] = b_p[:, j]
+                    b_p = aligned
                 boot_probs_list.append(b_p)
                 boot_preds_list.append(np.argmax(b_p, axis=1))
 

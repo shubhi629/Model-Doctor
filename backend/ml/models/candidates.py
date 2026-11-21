@@ -24,6 +24,7 @@ def get_candidate_models(
     class_counts: Optional[Dict[int, int]] = None,
     handle_imbalance: bool = True,
     random_state: int = 42,
+    fast: bool = False,
 ) -> Dict[str, Pipeline]:
     """
     Construct candidate classification pipelines with sensible defaults
@@ -43,6 +44,8 @@ def get_candidate_models(
         Whether to configure class weights / scale_pos_weight to balance classes.
     random_state : int, default=42
         Reproducibility seed.
+    fast : bool, default=False
+        Use fewer trees for Random Forest / XGBoost (quick demos and tests).
 
     Returns
     -------
@@ -50,6 +53,8 @@ def get_candidate_models(
         Mapping of candidate model name to full sklearn Pipeline.
     """
     candidates: Dict[str, Pipeline] = {}
+    rf_trees = 30 if fast else 200
+    xgb_trees = 30 if fast else 100
 
     # Determine class weight configuration
     class_weight = "balanced" if handle_imbalance else None
@@ -87,7 +92,7 @@ def get_candidate_models(
 
     # 3. Random Forest
     rf = RandomForestClassifier(
-        n_estimators=200,
+        n_estimators=rf_trees,
         class_weight=class_weight,
         random_state=random_state,
         n_jobs=-1,
@@ -100,7 +105,7 @@ def get_candidate_models(
     # 4. XGBoost Classifier
     if num_classes == 2:
         xgb = XGBClassifier(
-            n_estimators=100,
+            n_estimators=xgb_trees,
             max_depth=4,
             learning_rate=0.1,
             eval_metric="logloss",
@@ -110,7 +115,7 @@ def get_candidate_models(
         )
     else:
         xgb = XGBClassifier(
-            n_estimators=100,
+            n_estimators=xgb_trees,
             max_depth=4,
             learning_rate=0.1,
             eval_metric="mlogloss",

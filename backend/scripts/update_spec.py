@@ -1,7 +1,7 @@
 """Update PROJECT_SPEC.md with Task 5c design choices and findings."""
 from pathlib import Path
 
-spec_path = Path(__file__).resolve().parents[2] / "PROJECT_SPEC.md"
+spec_path = Path(__file__).resolve().parents[2] / "project_spec.md"
 with open(spec_path, "r", encoding="utf-8") as f:
     content = f.read()
 

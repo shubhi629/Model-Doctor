@@ -31,6 +31,29 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
+# Relative tolerance when deciding whether a value is outside Model 2's training range.
+SUPPORT_TOLERANCE = 1e-6
+
+# Direction in which each reliability signal indicates MORE risk (+1: higher is riskier,
+# -1: lower is riskier). Leaving the calibration range in the safe direction (e.g. an input
+# that is more typical than any calibration row) is clipped but not treated as unsupported.
+# Signals not listed count in both directions.
+RISK_DIRECTION = {
+    "max_prob": -1,
+    "margin": -1,
+    "entropy": +1,
+    "bootstrap_disagreement": +1,
+    "bootstrap_std": +1,
+    "knn_distance": +1,
+    "knn_distance_percentile": +1,
+    "isolation_score": +1,
+    "missing_count": +1,
+    "missing_fraction": +1,
+    "out_of_range_count": +1,
+    "unseen_category_count": +1,
+}
+
+
 def compute_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> float:
     """
     Expected Calibration Error (ECE) across n equal-width bins in [0, 1].
@@ -136,13 +159,60 @@ class Model2Detector(BaseEstimator, ClassifierMixin):
         if not isinstance(features_df, pd.DataFrame):
             features_df = pd.DataFrame(features_df)
 
-        X = features_df[self.feature_names]
+        X = self._clip_to_support(features_df[self.feature_names])
         probs = self.pipeline.predict_proba(X)
 
         if probs.shape[1] == 2:
             return np.clip(probs[:, 1], 0.0, 1.0)
         else:
             return np.clip(probs[:, 0], 0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Support of the training data (CALIBRATION split reliability features)
+    # ------------------------------------------------------------------
+    # Model 2 is fitted on a finite range of each reliability signal. Outside that
+    # range a linear model extrapolates without limit (e.g. a positive weight on
+    # knn_distance would make ever more distant inputs look ever more trustworthy).
+    # Inputs are therefore clipped to the observed range, and rows that needed
+    # clipping are reported so the mitigation layer can refuse to TRUST them.
+
+    def set_support(self, X: pd.DataFrame) -> "Model2Detector":
+        """Record the per-feature [min, max] of the data Model 2 was fitted on."""
+        X = X[self.feature_names].astype(float)
+        self.feature_min_ = {c: float(X[c].min()) for c in self.feature_names}
+        self.feature_max_ = {c: float(X[c].max()) for c in self.feature_names}
+        return self
+
+    def _has_support(self) -> bool:
+        # Artifacts saved before support tracking existed do not have these attributes.
+        return hasattr(self, "feature_min_") and hasattr(self, "feature_max_")
+
+    def _clip_to_support(self, X: pd.DataFrame) -> pd.DataFrame:
+        if not self._has_support():
+            return X
+        lo = pd.Series(self.feature_min_)[self.feature_names]
+        hi = pd.Series(self.feature_max_)[self.feature_names]
+        return X.astype(float).clip(lower=lo, upper=hi, axis=1)
+
+    def support_violations(self, features_df: pd.DataFrame) -> List[List[str]]:
+        """
+        For each row, the reliability features that lie outside the range seen when
+        Model 2 was trained, in their risky direction (see RISK_DIRECTION); an empty list
+        means the estimate is supported by training data. Non-finite values always count.
+        """
+        if not self._has_support():
+            return [[] for _ in range(len(features_df))]
+        X = features_df[self.feature_names].astype(float)
+        out_mask = pd.DataFrame(False, index=X.index, columns=self.feature_names)
+        for c in self.feature_names:
+            lo, hi = self.feature_min_[c], self.feature_max_[c]
+            tol = SUPPORT_TOLERANCE * (max(abs(lo), abs(hi)) + 1.0)
+            col = X[c].to_numpy()
+            direction = RISK_DIRECTION.get(c, 0)
+            below = (col < lo - tol) if direction <= 0 else np.zeros(len(col), dtype=bool)
+            above = (col > hi + tol) if direction >= 0 else np.zeros(len(col), dtype=bool)
+            out_mask[c] = ~np.isfinite(col) | below | above
+        return [[c for c in self.feature_names if row[c]] for _, row in out_mask.iterrows()]
 
 
 def evaluate_oof_cv(
@@ -362,6 +432,7 @@ def train_model2(
         ece=final_ece,
         brier_score=final_brier,
     )
+    detector.set_support(X)
 
     return {
         "status": "success",

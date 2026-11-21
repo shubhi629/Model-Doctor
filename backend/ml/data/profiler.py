@@ -55,7 +55,10 @@ def profile_dataset(df: pd.DataFrame, target_column: str) -> Dict[str, Any]:
                     f"Column '{col}' is constant (has only {unique_count} unique value) and provides no predictive signal."
                 )
 
-            # 2. Identifier-like columns
+            # 2. Identifier-like columns. Continuous float features are naturally
+            # all-unique, so only integer / string columns are treated as ID-like.
+            elif pd.api.types.is_float_dtype(series):
+                pass
             elif unique_count == row_count:
                 warnings.append(
                     f"Column '{col}' has 100% unique values ({unique_count} distinct) and may be an ID column."

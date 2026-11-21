@@ -201,7 +201,7 @@ For binary classification targets ($K=2$), `entropy` and `margin` are exact mono
 **Data-Driven Thresholds:**
 - **Tuned on Calibration OOF Only:** Thresholds are determined exclusively from out-of-fold cross-validated Model 2 probabilities on the calibration split.
 - **Trust Threshold ($\tau_{\text{trust}}$):** Chosen to meet the user's target selective risk (e.g. error among accepted predictions $\le 5\%$) while satisfying minimum coverage ($\ge 30\%$). If target risk cannot be met, the threshold achieving lowest risk at $\ge 30\%$ coverage is selected.
-- **Reject Threshold ($\tau_{\text{reject}}$):** Chosen via a data-driven scan descending below $\tau_{\text{trust}}$ to find the highest threshold where observed error rate is $\ge 30\%$ across at least 30 samples. If no threshold meets these criteria, `reject_threshold` is set to `None` and the REJECT band is disabled (predictions below $\tau_{\text{trust}}$ are routed to REVIEW).
+- **Reject Threshold ($\tau_{\text{reject}}$):** Chosen via a data-driven scan descending below $\tau_{\text{trust}}$ to find the highest threshold where observed error rate is $\ge \max(30\%, \min(50\%, 2 \times \text{overall calibration error}))$ across at least 30 samples. The relative term stops a model whose overall error already exceeds 30% from sending nearly every non-TRUST prediction to REJECT. If no threshold meets these criteria, `reject_threshold` is set to `None` and the REJECT band is disabled (predictions below $\tau_{\text{trust}}$ are routed to REVIEW).
 - **Decision Band Metadata:** Returned with each configuration, reporting band name, threshold range, sample count, coverage share, observed error rate, source (`"calibration_oof"`), and an explicit disclaimer note.
 - **Warning Merging:** For binary targets ($K=2$), redundant confidence-related flags (`HIGH_ENTROPY`, `LOW_MARGIN`, `LOW_CONFIDENCE`) are merged into a single `LOW_CONFIDENCE` warning. For multiclass targets, individual warnings are preserved.
 
@@ -443,3 +443,10 @@ After steps 3 and 5, **review the code explicitly for data leakage.**
 
 4. **Internal Ensemble Disagreement:**
    - Measuring bootstrap disagreement relative to the bootstrap ensemble's own majority prediction rather than against Model 1's calibrated probability eliminated the 0.36 artificial discrepancy previously observed, lowering mean disagreement to **0.0760**.
+
+5. **Reject band on high-error models (end-to-end build):**
+   - With a fixed 30% requirement, a multiclass model with 32% overall error sent 70% of calibration rows to REJECT (38.8% error, i.e. most of them correct) and left a single row in REVIEW. The requirement is now relative to the base error rate (see 7.5); on that dataset the REJECT band is correctly disabled and those predictions go to REVIEW.
+
+6. **Test-split results on three datasets (`RESULTS.md`):**
+   - Loans (binary), customer tiers (3 classes) and the real Wisconsin breast-cancer data: ModelDoctor matches the calibrated-confidence baseline at equal coverage (within about 0.2 points). On breast cancer, the calibration split has fewer than 30 errors, so the system correctly uses the confidence fallback.
+   - With each algorithm forced as Model 1, differences range from -1.6 to +1.6 points of selective risk. There is no consistent gain on i.i.d. data. The benefit of the reliability layer is per-record: out-of-range, unseen-category, missing and far-from-training inputs get warnings and much lower trustworthiness than Model 1's confidence.
