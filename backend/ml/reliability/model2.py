@@ -31,6 +31,29 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
+# Relative tolerance when deciding whether a value is outside Model 2's training range.
+SUPPORT_TOLERANCE = 1e-6
+
+# Direction in which each reliability signal indicates MORE risk (+1: higher is riskier,
+# -1: lower is riskier). Leaving the calibration range in the safe direction (e.g. an input
+# that is more typical than any calibration row) is clipped but not treated as unsupported.
+# Signals not listed count in both directions.
+RISK_DIRECTION = {
+    "max_prob": -1,
+    "margin": -1,
+    "entropy": +1,
+    "bootstrap_disagreement": +1,
+    "bootstrap_std": +1,
+    "knn_distance": +1,
+    "knn_distance_percentile": +1,
+    "isolation_score": +1,
+    "missing_count": +1,
+    "missing_fraction": +1,
+    "out_of_range_count": +1,
+    "unseen_category_count": +1,
+}
+
+
 def compute_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> float:
     """
     Expected Calibration Error (ECE) across n equal-width bins in [0, 1].
@@ -136,13 +159,60 @@ class Model2Detector(BaseEstimator, ClassifierMixin):
         if not isinstance(features_df, pd.DataFrame):
             features_df = pd.DataFrame(features_df)
 
-        X = features_df[self.feature_names]
+        X = self._clip_to_support(features_df[self.feature_names])
         probs = self.pipeline.predict_proba(X)
 
         if probs.shape[1] == 2:
             return np.clip(probs[:, 1], 0.0, 1.0)
         else:
             return np.clip(probs[:, 0], 0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Support of the training data (CALIBRATION split reliability features)
+    # ------------------------------------------------------------------
+    # Model 2 is fitted on a finite range of each reliability signal. Outside that
+    # range a linear model extrapolates without limit (e.g. a positive weight on
+    # knn_distance would make ever more distant inputs look ever more trustworthy).
+    # Inputs are therefore clipped to the observed range, and rows that needed
+    # clipping are reported so the mitigation layer can refuse to TRUST them.
+
+    def set_support(self, X: pd.DataFrame) -> "Model2Detector":
+        """Record the per-feature [min, max] of the data Model 2 was fitted on."""
+        X = X[self.feature_names].astype(float)
+        self.feature_min_ = {c: float(X[c].min()) for c in self.feature_names}
+        self.feature_max_ = {c: float(X[c].max()) for c in self.feature_names}
+        return self
+
+    def _has_support(self) -> bool:
+        # Artifacts saved before support tracking existed do not have these attributes.
+        return hasattr(self, "feature_min_") and hasattr(self, "feature_max_")
+
+    def _clip_to_support(self, X: pd.DataFrame) -> pd.DataFrame:
+        if not self._has_support():
+            return X
+        lo = pd.Series(self.feature_min_)[self.feature_names]
+        hi = pd.Series(self.feature_max_)[self.feature_names]
+        return X.astype(float).clip(lower=lo, upper=hi, axis=1)
+
+    def support_violations(self, features_df: pd.DataFrame) -> List[List[str]]:
+        """
+        For each row, the reliability features that lie outside the range seen when
+        Model 2 was trained, in their risky direction (see RISK_DIRECTION); an empty list
+        means the estimate is supported by training data. Non-finite values always count.
+        """
+        if not self._has_support():
+            return [[] for _ in range(len(features_df))]
+        X = features_df[self.feature_names].astype(float)
+        out_mask = pd.DataFrame(False, index=X.index, columns=self.feature_names)
+        for c in self.feature_names:
+            lo, hi = self.feature_min_[c], self.feature_max_[c]
+            tol = SUPPORT_TOLERANCE * (max(abs(lo), abs(hi)) + 1.0)
+            col = X[c].to_numpy()
+            direction = RISK_DIRECTION.get(c, 0)
+            below = (col < lo - tol) if direction <= 0 else np.zeros(len(col), dtype=bool)
+            above = (col > hi + tol) if direction >= 0 else np.zeros(len(col), dtype=bool)
+            out_mask[c] = ~np.isfinite(col) | below | above
+        return [[c for c in self.feature_names if row[c]] for _, row in out_mask.iterrows()]
 
 
 def evaluate_oof_cv(
@@ -151,89 +221,39 @@ def evaluate_oof_cv(
     y: np.ndarray,
     cv_splits: List[Tuple[np.ndarray, np.ndarray]],
 ) -> Tuple[np.ndarray, float]:
-
-    import warnings
-
+    """
+    Compute Out-Of-Fold (OOF) predicted probabilities and CV AUROC for detecting errors.
+    Target: 1 = correct, 0 = incorrect.
+    Error AUROC: ranking incorrect predictions higher (using P(incorrect) = 1 - P(correct)).
+    """
     n_samples = len(X)
     oof_probs = np.zeros(n_samples, dtype=np.float64)
 
-    for fold, (train_idx, val_idx) in enumerate(cv_splits, 1):
-
+    for train_idx, val_idx in cv_splits:
         X_tr, y_tr = X.iloc[train_idx], y[train_idx]
-        X_va = X.iloc[val_idx]
-
-        print(f"\nChecking fold {fold}/5")
+        X_va, y_va = X.iloc[val_idx], y[val_idx]
 
         fold_pipe = clone(pipeline)
+        fold_pipe.fit(X_tr, y_tr)
 
-        # Step 1: Check model training
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", RuntimeWarning)
-                fold_pipe.fit(X_tr, y_tr)
-
-            print("Training: PASSED")
-
-        except Exception as e:
-            print("TRAINING FAILED:", repr(e))
-            print("Training data finite:",
-                  np.isfinite(X_tr.to_numpy()).all())
-            print("Training max abs:",
-                  np.max(np.abs(X_tr.to_numpy())))
-            raise
-
-                # Step 2: Check predictions
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", RuntimeWarning)
-
-                X_scaled = fold_pipe.named_steps["scaler"].transform(X_va)
-                clf = fold_pipe.named_steps["classifier"]
-
-                print("Scaled shape:", X_scaled.shape)
-                print("Scaled dtype:", X_scaled.dtype)
-                print("Scaled min:", np.min(X_scaled))
-                print("Scaled max:", np.max(X_scaled))
-
-                if hasattr(clf, "coef_"):
-                    print("Coefficient shape:", clf.coef_.shape)
-                    print("Coefficient dtype:", clf.coef_.dtype)
-                    print("Coefficient min:", np.min(clf.coef_))
-                    print("Coefficient max:", np.max(clf.coef_))
-
-                p = fold_pipe.predict_proba(X_va)
-
-            print("Prediction: PASSED")
-
-        except Exception as e:
-            print("PREDICTION FAILED:", repr(e))
-
-            X_scaled = fold_pipe.named_steps["scaler"].transform(X_va)
-
-            print("Validation finite:", np.isfinite(X_scaled).all())
-            print("Validation max abs:", np.max(np.abs(X_scaled)))
-
-            clf = fold_pipe.named_steps["classifier"]
-
-            if hasattr(clf, "coef_"):
-                print("Coefficients finite:", np.isfinite(clf.coef_).all())
-                print("Max coefficient:", np.max(np.abs(clf.coef_)))
-
-            raise
+        p = fold_pipe.predict_proba(X_va)
         if p.shape[1] == 2:
             oof_probs[val_idx] = p[:, 1]
         else:
             oof_probs[val_idx] = p[:, 0]
 
+    # AUROC for identifying incorrect predictions
+    # y=0 is incorrect, y=1 is correct.
+    # Score for incorrect: 1 - oof_probs
     is_incorrect = (1 - y).astype(int)
     error_risk = 1.0 - oof_probs
-
     try:
         auroc = float(roc_auc_score(is_incorrect, error_risk))
     except Exception:
         auroc = 0.5
 
     return oof_probs, auroc
+
 
 def train_model2(
     features_df: pd.DataFrame,
@@ -336,10 +356,18 @@ def train_model2(
     ])
     X_conf = features_df[["max_prob"]].copy()
     oof_conf_probs, conf_ref_auroc = evaluate_oof_cv(conf_pipe, X_conf, y_arr, cv_splits)
-    # Candidate 1: Logistic Regression temporarily skipped
-    # Confidence baseline retained for comparison only.
-    oof_lr_probs = oof_conf_probs.copy()
-    lr_auroc = conf_ref_auroc
+
+    # Candidate 1: Logistic Regression (UNWEIGHTED for honest probability calibration)
+    # RATIONALE: We remove class_weight="balanced" because we want true empirical probabilities,
+    # not probabilities artificially shifted toward a synthetic 50/50 prior.
+    lr_pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", LogisticRegression(
+            max_iter=1000,
+            random_state=random_state,
+        )),
+    ])
+    oof_lr_probs, lr_auroc = evaluate_oof_cv(lr_pipe, X, y_arr, cv_splits)
 
     # Candidate 2: Small regularized Gradient Boosting (calibrated with sigmoid)
     # RATIONALE: Wrapped in CalibratedClassifierCV with method="sigmoid" because the calibration
@@ -359,22 +387,33 @@ def train_model2(
 
     # Compute ECE and Brier scores for all candidates
     candidates_scores = {
-    "Gradient Boosting": {
-        "cv_auroc": round(gb_auroc, 4),
-        "ece": compute_ece(y_arr, oof_gb_probs),
-        "brier": compute_brier_score(y_arr, oof_gb_probs),
-    },
-    "Confidence Baseline (max_prob only)": {
-        "cv_auroc": round(conf_ref_auroc, 4),
-        "ece": compute_ece(y_arr, oof_conf_probs),
-        "brier": compute_brier_score(y_arr, oof_conf_probs),
-    },
-}
+        "Logistic Regression": {
+            "cv_auroc": round(lr_auroc, 4),
+            "ece": compute_ece(y_arr, oof_lr_probs),
+            "brier": compute_brier_score(y_arr, oof_lr_probs),
+        },
+        "Gradient Boosting": {
+            "cv_auroc": round(gb_auroc, 4),
+            "ece": compute_ece(y_arr, oof_gb_probs),
+            "brier": compute_brier_score(y_arr, oof_gb_probs),
+        },
+        "Confidence Baseline (max_prob only)": {
+            "cv_auroc": round(conf_ref_auroc, 4),
+            "ece": compute_ece(y_arr, oof_conf_probs),
+            "brier": compute_brier_score(y_arr, oof_conf_probs),
+        },
+    }
 
-    winner_name = "Gradient Boosting"
-    winner_pipe = gb_pipe
-    oof_trustworthiness = oof_gb_probs
-    winner_auroc = gb_auroc
+    if gb_auroc > lr_auroc:
+        winner_name = "Gradient Boosting"
+        winner_pipe = gb_pipe
+        oof_trustworthiness = oof_gb_probs
+        winner_auroc = gb_auroc
+    else:
+        winner_name = "Logistic Regression"
+        winner_pipe = lr_pipe
+        oof_trustworthiness = oof_lr_probs
+        winner_auroc = lr_auroc
 
     # Final fit on the entire calibration split
     final_pipeline = clone(winner_pipe)
@@ -393,6 +432,7 @@ def train_model2(
         ece=final_ece,
         brier_score=final_brier,
     )
+    detector.set_support(X)
 
     return {
         "status": "success",
@@ -406,9 +446,10 @@ def train_model2(
         "brier_score": final_brier,
         "reliability_table": rel_table,
         "oof_candidates": {
-    "Gradient Boosting": oof_gb_probs,
-    "Confidence Baseline": oof_conf_probs,
-},
+            "Logistic Regression": oof_lr_probs,
+            "Gradient Boosting": oof_gb_probs,
+            "Confidence Baseline": oof_conf_probs,
+        },
         "n_correct": n_correct,
         "n_incorrect": n_incorrect,
         "message": None,

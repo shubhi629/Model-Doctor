@@ -114,6 +114,7 @@ def select_model(
     force_model: Optional[str] = None,
     handle_imbalance: bool = True,
     random_state: int = 42,
+    fast: bool = False,
 ) -> Dict[str, Any]:
     """
     Run automated model selection over candidate algorithms on the Train split,
@@ -141,6 +142,8 @@ def select_model(
         Whether to enable balanced class weighting.
     random_state : int, default=42
         Reproducibility seed.
+    fast : bool, default=False
+        Use smaller tree ensembles (quick demos and tests).
 
     Returns
     -------
@@ -163,6 +166,7 @@ def select_model(
         class_counts=class_counts_dict,
         handle_imbalance=handle_imbalance,
         random_state=random_state,
+        **({"fast": True} if fast else {}),
     )
 
     # Validate force_model if provided

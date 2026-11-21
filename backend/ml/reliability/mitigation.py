@@ -17,6 +17,30 @@ Threshold rules:
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 
+# Risk level communicated with each decision (a fixed label of the decision, not a new score).
+RISK_LEVELS: Dict[str, str] = {"TRUST": "LOW", "REVIEW": "MEDIUM", "REJECT": "HIGH"}
+
+# Which explanation group each warning code belongs to (used by the API and dashboard).
+WARNING_CATEGORIES: Dict[str, str] = {
+    "OUT_OF_RANGE": "out_of_distribution",
+    "UNSEEN_CATEGORY": "out_of_distribution",
+    "OOD_DISTANCE": "out_of_distribution",
+    "UNSUPPORTED_ESTIMATE": "out_of_distribution",
+    "ANOMALOUS_INPUT": "anomaly",
+    "MISSING_FIELD": "missing_information",
+    "MISSING_FIELDS": "missing_information",
+    "MODEL_DISAGREEMENT": "model_disagreement",
+    "LOW_CONFIDENCE": "uncertainty",
+    "HIGH_ENTROPY": "uncertainty",
+    "LOW_MARGIN": "uncertainty",
+    "LOW_TRUSTWORTHINESS": "low_trustworthiness",
+}
+DOMAIN_ANOMALY_FLAGS = ("out_of_range", "unseen_category")
+
+
+def _pct(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
 
 def compute_decision_band_metadata(
     oof_trustworthiness: np.ndarray,
@@ -102,6 +126,8 @@ def tune_mitigation_thresholds(
     reject_threshold: Optional[float] = None,
     reject_min_error: float = 0.30,
     reject_min_rows: int = 30,
+    reject_relative_factor: float = 2.0,
+    reject_error_cap: float = 0.50,
 ) -> Dict[str, Any]:
     """
     Select optimal trust and reject cutoffs from Out-Of-Fold (OOF) calibration probabilities.
@@ -122,6 +148,14 @@ def tune_mitigation_thresholds(
         Minimum error rate required in the REJECT band.
     reject_min_rows : int, default=30
         Minimum sample size required in the REJECT band.
+    reject_relative_factor : float, default=2.0
+        The REJECT band must also show at least this multiple of the overall
+        calibration error rate (capped at ``reject_error_cap``). Without it, a model
+        whose overall error already exceeds ``reject_min_error`` would send nearly
+        every non-TRUST prediction to REJECT, even when most of them are correct.
+    reject_error_cap : float, default=0.50
+        Upper bound on the relative requirement: a band where predictions are more
+        likely wrong than right always qualifies.
 
     Returns
     -------
@@ -224,8 +258,11 @@ def tune_mitigation_thresholds(
             msg_reject = f"Manual reject threshold adjusted below trust threshold to {chosen_reject:.3f}."
     else:
         # Data-driven: find highest value tau < chosen_trust such that
-        # observed error rate for trustworthiness < tau is >= reject_min_error
-        # and has at least reject_min_rows.
+        # observed error rate for trustworthiness < tau is >= the required error
+        # (max of reject_min_error and a multiple of the base error, capped) and
+        # has at least reject_min_rows.
+        base_error = float(np.mean(1 - y_arr))
+        required_error = max(reject_min_error, min(reject_error_cap, reject_relative_factor * base_error))
         candidate_rejects = np.unique(np.clip(np.round(oof_trust, 4), 0.10, chosen_trust - 0.001))
         # Scan descending (highest first)
         candidate_rejects = np.sort(candidate_rejects)[::-1]
@@ -235,18 +272,18 @@ def tune_mitigation_thresholds(
             n_rej = int(np.sum(rejected))
             if n_rej >= reject_min_rows:
                 err_rate = float(np.mean(1 - y_arr[rejected]))
-                if err_rate >= reject_min_error:
+                if err_rate >= required_error:
                     chosen_reject = float(tau)
                     msg_reject = (
                         f"Data-driven reject threshold set at {chosen_reject:.3f} "
-                        f"({n_rej} rows, observed error rate {err_rate*100:.1f}% >= {reject_min_error*100:.1f}%)."
+                        f"({n_rej} rows, observed error rate {err_rate*100:.1f}% >= {required_error*100:.1f}%)."
                     )
                     break
 
         if chosen_reject is None:
             msg_reject = (
                 f"No threshold below trust threshold ({chosen_trust:.3f}) has an observed error rate "
-                f">= {reject_min_error*100:.1f}% across at least {reject_min_rows} rows; REJECT band disabled."
+                f">= {required_error*100:.1f}% across at least {reject_min_rows} rows; REJECT band disabled."
             )
 
     full_message = f"{msg_trust} {msg_reject}".strip()
@@ -321,6 +358,15 @@ def generate_warnings(
             warnings.append({
                 "code": "LOW_MARGIN",
                 "message": "small margin between top predicted classes",
+            })
+        elif f_type == "outside_reliability_support":
+            feats = ", ".join(flag.get("features", []))
+            warnings.append({
+                "code": "UNSUPPORTED_ESTIMATE",
+                "message": (
+                    "reliability signals are outside the range the reliability model was trained on "
+                    f"({feats}), so the trustworthiness estimate is an extrapolation"
+                ),
             })
 
     # Grouped missing fields
@@ -441,10 +487,16 @@ class MitigationEngine:
         else:
             decision = "REVIEW"
 
+        # Mandatory: never auto-TRUST when Model 2 had to extrapolate beyond its training data
+        if decision == "TRUST" and any(
+            f.get("type") == "outside_reliability_support" for f in (record_flags or [])
+        ):
+            decision = "REVIEW"
+
         # Optional override: force at least REVIEW when domain anomalies occur
         if self.force_review_on_anomalies and decision == "TRUST" and record_flags:
             has_domain_anomaly = any(
-                f.get("type") in ["out_of_range", "unseen_category"]
+                f.get("type") in DOMAIN_ANOMALY_FLAGS
                 for f in record_flags
             )
             if has_domain_anomaly:
@@ -475,6 +527,66 @@ class MitigationEngine:
             "decision": decision,
             "warnings": warnings,
         }
+
+    def explain(
+        self,
+        trustworthiness: float,
+        decision: str,
+        warnings: List[Dict[str, str]],
+        reliability_mode: str = "model2",
+    ) -> Dict[str, Any]:
+        """
+        Plain-English account of a decision, built only from the thresholds and the
+        warnings that produced it.
+
+        Returns {"risk_level", "explanation" (one-sentence summary), "reasons" (list)}.
+        """
+        t, trust_t = _pct(trustworthiness), _pct(self.trust_threshold)
+        codes = {w["code"] for w in warnings}
+        reasons: List[str] = []
+
+        if decision == "TRUST":
+            reasons.append(f"Trustworthiness {t} is at or above the trust threshold {trust_t}.")
+            summary = "Accepted: this prediction meets the reliability criteria for automatic use."
+        elif decision == "REVIEW":
+            if trustworthiness >= self.trust_threshold:
+                if "UNSUPPORTED_ESTIMATE" in codes:
+                    reasons.append(
+                        f"Trustworthiness {t} meets the trust threshold {trust_t}, but the reliability model had to "
+                        "extrapolate beyond the data it was trained on, so the estimate cannot be relied on."
+                    )
+                else:
+                    reasons.append(
+                        f"Trustworthiness {t} meets the trust threshold {trust_t}, but the input has out-of-range or "
+                        "unseen values and this model is configured to send such inputs to review."
+                    )
+            elif self.reject_threshold is None:
+                reasons.append(f"Trustworthiness {t} is below the trust threshold {trust_t}.")
+            else:
+                reasons.append(
+                    f"Trustworthiness {t} is below the trust threshold {trust_t} but not below the reject "
+                    f"threshold {_pct(self.reject_threshold)}."
+                )
+            summary = "Needs human review: a person should verify this prediction before it is used."
+        else:
+            reject_t = _pct(self.reject_threshold) if self.reject_threshold is not None else trust_t
+            reasons.append(f"Trustworthiness {t} is below the reject threshold {reject_t}.")
+            summary = (
+                "Rejected: ModelDoctor abstains because this prediction is too likely to be wrong to act on."
+            )
+
+        for w in warnings:
+            if w["code"] == "LOW_TRUSTWORTHINESS":
+                continue
+            msg = w["message"].rstrip(".")
+            reasons.append(msg[:1].upper() + msg[1:] + ".")
+
+        if reliability_mode != "model2":
+            reasons.append(
+                "Trustworthiness equals Model 1's calibrated confidence here: the calibration split had too few "
+                "errors to train the separate reliability model."
+            )
+        return {"risk_level": RISK_LEVELS[decision], "explanation": summary, "reasons": reasons}
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize configuration to a JSON-compatible dictionary."""

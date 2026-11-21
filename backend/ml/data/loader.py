@@ -120,20 +120,21 @@ def load_dataset(
             "for meaningful train, calibration, and test splits."
         )
 
-    # 3. Validate target column has no missing values
     target_series = df[target_column]
+
+    # 3. Check for continuous target (Regression is strictly out of scope)
+    if is_continuous_target(target_series):
+        raise UnsupportedTaskError(
+            "Only classification targets are supported in this version. "
+            f"Target '{target_column}' appears to be a continuous numeric variable."
+        )
+
+    # 4. Validate target column has no missing values
     missing_targets = target_series.isna().sum()
     if missing_targets > 0:
         raise InvalidTargetError(
             f"Target column '{target_column}' contains {missing_targets} missing values. "
             "Target column cannot contain missing values."
-        )
-
-    # 4. Check for continuous target (Regression is strictly out of scope)
-    if is_continuous_target(target_series):
-        raise UnsupportedTaskError(
-            "Only classification targets are supported in this version. "
-            f"Target '{target_column}' appears to be a continuous numeric variable."
         )
 
     # 5. Validate at least 2 distinct classes
